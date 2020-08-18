@@ -1,0 +1,6 @@
+seuss_sbatch.sh
+sbatch_run.sh
+__pycache__/*
+hopper*/*
+hopper*
+dump*
