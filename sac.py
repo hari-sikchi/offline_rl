@@ -232,13 +232,38 @@ class SAC:
 
         current_action, _ = self.ac.pi(o)
         cql_alpha = 5
+        # import ipdb; ipdb.set_trace()
         if self.algo == 'CQL':
-            # Sample from previous policy
-            cql_loss_q1 = self.ac_targ.q1(o, current_action)
-            cql_loss_q2 = self.ac_targ.q2(o, current_action)
+            # print("CQL update")
+            
+            samples = 10 
+            # Sample from previous policy (10 samples)
+            cql_loss_q1 = None
+            for sample in range(samples):
+                sample_action, _ = self.ac.pi(o)
+                
+                if cql_loss_q1 is None:
+                    cql_loss_q1 = self.ac.q1(o,sample_action).view(-1,1)
+                    cql_loss_q2 = self.ac.q2(o,sample_action).view(-1,1)
+                    
+                else:
+                    cql_loss_q1 = torch.cat((cql_loss_q1,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
+                    cql_loss_q2 = torch.cat((cql_loss_q2,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
+
+            cql_loss_q1 = cql_loss_q1-np.log(samples)
+            cql_loss_q2 = cql_loss_q2-np.log(samples)
+
+            cql_loss_q1 = torch.logsumexp(cql_loss_q1,dim=1).mean()
+            cql_loss_q2 = torch.logsumexp(cql_loss_q2,dim=1).mean()
+
+            # import ipdb; ipdb.set_trace()
+            # cql_losses_q2 = [self.ac.q2(o,self.ac.pi(o)[0]) for sample in range(samples)]
+
+            # cql_loss_q1 = self.ac_targ.q1(o, current_action)
+            # cql_loss_q2 = self.ac_targ.q2(o, current_action)
             # Sample from dataset
-            cql_loss_q1 -= self.ac_targ.q1(o, a)
-            cql_loss_q2 -= self.ac_targ.q2(o, a)
+            cql_loss_q1 -= self.ac.q1(o, a).mean()
+            cql_loss_q2 -= self.ac.q2(o, a).mean()
 
 
             # import ipdb;ipdb.set_trace()

@@ -13,7 +13,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     env_fn = lambda:gym.make(args.env)
 
-    sac_agent = sac.SAC(env_fn, logger_kwargs={'output_dir':args.exp_name}, seed=args.seed) 
+    sac_agent = sac.SAC(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
     sac_agent.populate_replay_buffer()
 
     sac_agent.run()
