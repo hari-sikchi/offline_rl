@@ -46,8 +46,8 @@ class ReplayBuffer:
 class SAC:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(1e6), gamma=0.99, 
+        polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1, algo='SAC'):
         """
@@ -164,7 +164,7 @@ class SAC:
         self.ac = actor_critic(self.env.observation_space, self.env.action_space, **ac_kwargs)
         self.ac_targ = deepcopy(self.ac)
         self.gamma  = gamma
-        self.alpha = alpha
+
 
         # Freeze target networks with respect to optimizers (only update via polyak averaging)
         for p in self.ac_targ.parameters():
@@ -180,9 +180,28 @@ class SAC:
         var_counts = tuple(core.count_vars(module) for module in [self.ac.pi, self.ac.q1, self.ac.q2])
         self.logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
         self.algo = algo
+
+
+        # Algorithm specific hyperparams
+        if 'CWR' in self.algo:
+            self.alpha = 0 # CWR does not require entropy in Q evaluation
+            self.target_update_freq = 100
+            self.p_lr = 1e-4
+            self.lr = 1e-4
+        elif self.algo == 'CQL':
+            self.alpha = alpha # CWR does not require entropy in Q evaluation
+            self.target_update_freq = 1
+            self.p_lr = 3e-5
+            self.lr = 3e-4
+        else:
+            self.alpha = alpha # CWR does not require entropy in Q evaluation
+            self.target_update_freq = 1
+            self.p_lr = 1e-3
+            self.lr = 1e-3
+
         # Set up optimizers for policy and q-function
-        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=lr)
-        self.q_optimizer = Adam(self.q_params, lr=lr)
+        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr)
+        self.q_optimizer = Adam(self.q_params, lr=self.lr)
         self.num_test_episodes = num_test_episodes
         self.max_ep_len = max_ep_len
         self.epochs= epochs
@@ -194,7 +213,7 @@ class SAC:
         self.polyak = polyak
         # Set up model saving
         self.logger.setup_pytorch_saver(self.ac)
-
+        print("Running Offline RL algorithm: {}".format(self.algo))
 
 
     def populate_replay_buffer(self):
@@ -230,12 +249,10 @@ class SAC:
         loss_q = loss_q1 + loss_q2
 
 
-        current_action, _ = self.ac.pi(o)
-        cql_alpha = 5
-        # import ipdb; ipdb.set_trace()
+
         if self.algo == 'CQL':
             # print("CQL update")
-            
+            cql_alpha = 5
             samples = 10 
             # Sample from previous policy (10 samples)
             cql_loss_q1 = None
@@ -256,19 +273,11 @@ class SAC:
             cql_loss_q1 = torch.logsumexp(cql_loss_q1,dim=1).mean()
             cql_loss_q2 = torch.logsumexp(cql_loss_q2,dim=1).mean()
 
-            # import ipdb; ipdb.set_trace()
-            # cql_losses_q2 = [self.ac.q2(o,self.ac.pi(o)[0]) for sample in range(samples)]
-
-            # cql_loss_q1 = self.ac_targ.q1(o, current_action)
-            # cql_loss_q2 = self.ac_targ.q2(o, current_action)
             # Sample from dataset
             cql_loss_q1 -= self.ac.q1(o, a).mean()
             cql_loss_q2 -= self.ac.q2(o, a).mean()
 
-
-            # import ipdb;ipdb.set_trace()
             loss_q += cql_alpha*(cql_loss_q1.mean() + cql_loss_q2.mean())
-            # loss_q -= cql_alpha*(q1.mean() + q2.mean())
             
 
         # Useful info for logging
@@ -286,7 +295,38 @@ class SAC:
         q_pi = torch.min(q1_pi, q2_pi)
 
         # Entropy-regularized policy loss
-        loss_pi = (self.alpha * logp_pi - q_pi).mean()
+        if 'CWR' in self.algo:
+            # TODO: Check the number of samples used in paper
+            samples = 4
+            beta = 1
+            threshold = 20
+            # Sample actions for advantage calculation
+            q1_values = None
+            q2_values = None
+            for i in range(samples):
+                sample_action, _ = self.ac.pi(o)
+                if q1_values is None:
+                    q1_values = self.ac.q1(o,sample_action).view(-1,1)
+                    q2_values = self.ac.q2(o,sample_action).view(-1,1)
+                else:
+                    q1_values = torch.cat((q1_values,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
+                    q2_values = torch.cat((q2_values,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
+            if self.algo == 'CWR-exp': # Also known as AWAC
+                adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1)
+                adv_weight = torch.exp(torch.min(adv/beta,torch.Tensor([np.log(20)])))
+                loss_pi = -(logp_pi * adv_weight.detach()).mean()
+            elif self.algo == 'CWR-binary':
+                adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1).detach()
+                adv_weight = torch.max(adv, torch.tensor([0]).float())
+                loss_pi = -(logp_pi * adv_weight).mean()
+            elif self.algo == 'CWR-binary-max':
+                # import ipdb; ipdb.set_trace()
+                adv = q_pi - torch.max(torch.min(q1_values, q2_values),dim=1).values.detach()
+                adv_weight = torch.max(adv, torch.tensor([0]).float())
+                loss_pi = -(logp_pi * adv_weight).mean()
+        else:
+            loss_pi = (self.alpha * logp_pi - q_pi).mean()
+
 
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().numpy())
@@ -295,7 +335,7 @@ class SAC:
 
 
 
-    def update(self,data):
+    def update(self,data, update_timestep):
         # First run one gradient descent step for Q1 and Q2
         self.q_optimizer.zero_grad()
         loss_q, q_info = self.compute_loss_q(data)
@@ -324,12 +364,13 @@ class SAC:
         self.logger.store(LossPi=loss_pi.item(), **pi_info)
 
         # Finally, update target networks by polyak averaging.
-        with torch.no_grad():
-            for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
-                # NB: We use an in-place operations "mul_", "add_" to update target
-                # params, as opposed to "mul" and "add", which would make new tensors.
-                p_targ.data.mul_(self.polyak)
-                p_targ.data.add_((1 - self.polyak) * p.data)
+        if update_timestep%self.target_update_freq==0:
+            with torch.no_grad():
+                for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(self.polyak)
+                    p_targ.data.add_((1 - self.polyak) * p.data)
 
     def get_action(self, o, deterministic=False):
         return self.ac.act(torch.as_tensor(o, dtype=torch.float32), 
@@ -343,7 +384,7 @@ class SAC:
                 o, r, d, _ = self.test_env.step(self.get_action(o, True))
                 ep_ret += r
                 ep_len += 1
-            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            self.logger.store(TestEpRet=self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
         # Prepare for interaction with environment
@@ -356,7 +397,7 @@ class SAC:
 
             # # Update handling
             batch = self.replay_buffer.sample_batch(self.batch_size)
-            self.update(data=batch)
+            self.update(data=batch, update_timestep = t)
 
             # End of epoch handling
             if (t+1) % self.steps_per_epoch == 0:
