@@ -9,7 +9,10 @@ python run_agent.py --env <env_name>  --seed <seed_no>  --exp_name <experiment n
 
 ## List of Implemented Algorithms
 * 'SAC' : Soft Actor Critic
-* 'CQL' : Conservative Q learning
+* 'CQL-rho-fixed' : Conservative Q learning rho-version fixed alpha
+* 'CQL-rho-lagrange' : Conservative Q learning rho-version trained alpha
+* 'CQL-H-fixed' : Conservative Q learning H-version fixed alpha
+* 'CQL-H-lagrange' : Conservative Q learning H-version trained alpha
 * 'CWR-exp' : Critic weighted regression (exponential filtering) or AWAC (Advantage weighted actor critic)
 * 'CWR-binary': Critic weighted regression (binary filtering)
 * 'CWR-binary-max': Critic weighted regression (binary filtering with pessimistic advantage estimates)
