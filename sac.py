@@ -46,7 +46,7 @@ class ReplayBuffer:
 class SAC:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=100, epochs=10000, replay_size=int(1e6), gamma=0.99, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(1500000), gamma=0.99, 
         polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1, algo='SAC'):
@@ -384,7 +384,7 @@ class SAC:
                 o, r, d, _ = self.test_env.step(self.get_action(o, True))
                 ep_ret += r
                 ep_len += 1
-            self.logger.store(TestEpRet=self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
+            self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
         # Prepare for interaction with environment

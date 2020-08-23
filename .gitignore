@@ -5,3 +5,6 @@ hopper*/*
 hopper*
 dump*
 data*
+*.pyc
+*.pyo
+__pycache__/
