@@ -1,5 +1,6 @@
 import sac
 from CQL.cql import CQL
+from EMAQ.emaq import EMAQ
 import argparse
 import gym
 
@@ -16,6 +17,8 @@ if __name__ == "__main__":
 
     if 'CQL' in args.algorithm:
         agent = CQL(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
+    elif 'EMAQ' in args.algorithm:
+        agent = EMAQ(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
     else:
         agent = sac.SAC(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
     
