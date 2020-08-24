@@ -16,7 +16,7 @@ python run_agent.py --env <env_name>  --seed <seed_no>  --exp_name <experiment n
 * 'CWR-exp' : Critic weighted regression (exponential filtering) or AWAC (Advantage weighted actor critic)
 * 'CWR-binary': Critic weighted regression (binary filtering)
 * 'CWR-binary-max': Critic weighted regression (binary filtering with pessimistic advantage estimates)
-
+* 'EMAQ': Expected Max Q learning operator
 
 ## Plotting
 ```
