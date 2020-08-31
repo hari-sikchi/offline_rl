@@ -46,15 +46,11 @@ class ReplayBuffer:
 
 
 '''
-CQL variants
-cql-rho-fixedAlpha
-cql-rho-lagrange
-cql-H-fixedAlpha
-cql-H-lagrange
+EMAQ 
 '''
-class EMAQ:
+class EMAQ_LP:
 
-    def __init__(self, env_fn, env_name=None, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+    def __init__(self, env_fn,env_name = None, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=100, epochs=10000, replay_size=int(2000000), gamma=0.99, 
         polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
@@ -197,10 +193,10 @@ class EMAQ:
         self.tune_lambda = True if 'lagrange' in self.algo else False
 
 
-        self.alpha = 0 
+        self.alpha = alpha # CWR does not require entropy in Q evaluation
         self.target_update_freq = 1
         self.p_lr = 3e-5
-        self.lr = 3e-4
+        self.lr = 1e-4
         self.n_samples = 100
         self.env_name = env_name
 
@@ -229,166 +225,37 @@ class EMAQ:
         self.replay_buffer.done_buf[:dataset['terminals'].shape[0]] = dataset['terminals']
         self.replay_buffer.size = dataset['observations'].shape[0]
         self.replay_buffer.ptr = (self.replay_buffer.size+1)%(self.replay_buffer.max_size)
-    # Set up function for computing SAC Q-losses
-    def compute_loss_q(self, data):
-        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
-        sampled_actions_q1 = None
-        sampled_actions_q2 = None
-        for i in range(self.n_samples):
-            z = np.random.randn(a.shape[0],a.shape[1])
-            z = torch.FloatTensor(z)
-            actions, _ = self.sampling_policy.inverse(z,y=o2)
-            if sampled_actions_q1 is None:
-                sampled_actions_q1 = self.ac_targ.q1(o2,actions).view(-1,1)
-                sampled_actions_q2 = self.ac_targ.q2(o2,actions).view(-1,1)            
-            else:
-                sampled_actions_q1 = torch.cat((sampled_actions_q1,self.ac_targ.q1(o2,actions).view(-1,1)),dim=1)
-                sampled_actions_q2 = torch.cat((sampled_actions_q2,self.ac_targ.q2(o2,actions).view(-1,1)),dim=1)
-
-        
-        q1 = self.ac.q1(o,a)
-        q2 = self.ac.q2(o,a)
-
-        # Bellman backup for Q functions
-        with torch.no_grad():
-            # Target actions come from *current* policy
-            a2, logp_a2 = self.ac.pi(o2)
-            # Target Q-values
-            q1_pi_targ = torch.max(sampled_actions_q1,dim=1).values
-            q2_pi_targ = torch.max(sampled_actions_q2,dim=1).values
-            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-            backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha * logp_a2)
-
-        # MSE loss against Bellman backup
-        loss_q1 = ((q1 - backup)**2).mean()
-        loss_q2 = ((q2 - backup)**2).mean()
-        loss_q = loss_q1 + loss_q2
-
-        # Useful info for logging
-        q_info = dict(Q1Vals=q1.detach().numpy(),
-                      Q2Vals=q2.detach().numpy())
-
-        return loss_q, q_info
-
-
-
-    def update(self,data, update_timestep):
-        # First run one gradient descent step for Q1 and Q2
-        self.q_optimizer.zero_grad()
-        loss_q, q_info = self.compute_loss_q(data)
-        loss_q.backward()
-        self.q_optimizer.step()
-
-        # Record things
-        self.logger.store(LossQ=loss_q.item(), **q_info)
-
-
-        # Finally, update target networks by polyak averaging.
-        if update_timestep%self.target_update_freq==0:
-            with torch.no_grad():
-                for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
-                    p_targ.data.mul_(self.polyak)
-                    p_targ.data.add_((1 - self.polyak) * p.data)
-
-    def get_action(self, o, deterministic=False):
-        sampled_actions_q1 = None
-        sampled_actions_q2 = None
-        sampled_actions = []
-        o = torch.FloatTensor(o).view(1,-1)
-        for i in range(self.n_samples):
-            z = np.random.randn(1,self.act_dim)
-            z = torch.FloatTensor(z)
-            actions, _ = self.sampling_policy.inverse(z,y=o)
-            sampled_actions.append(actions)
-            if sampled_actions_q1 is None:
-                sampled_actions_q1 = self.ac.q1(o,actions).view(-1,1)
-                sampled_actions_q2 = self.ac.q2(o,actions).view(-1,1)            
-            else:
-                sampled_actions_q1 = torch.cat((sampled_actions_q1,self.ac.q1(o,actions).view(-1,1)),dim=1)
-                sampled_actions_q2 = torch.cat((sampled_actions_q2,self.ac.q2(o,actions).view(-1,1)),dim=1)
-
-        q_values = torch.min(sampled_actions_q1,sampled_actions_q2)
-        max_idx = torch.argmax(q_values.view(-1))
-        return sampled_actions[max_idx].detach().cpu().numpy()
-
-
-
-    def test_agent(self):
-        for j in range(self.num_test_episodes):
-            o, d, ep_ret, ep_len = self.test_env.reset(), False, 0, 0
-            while not(d or (ep_len == self.max_ep_len)):
-                # Take deterministic actions at test time 
-                o, r, d, _ = self.test_env.step(self.get_action(o, True))
-                ep_ret += r
-                ep_len += 1
-            self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
 
         # Learn a generative model for data
-        # density_epochs = 50
-        # self.sampling_policy = core.MADE(self.act_dim, 256, 2 , cond_label_size = self.obs_dim[0])
-        # density_optimizer = torch.optim.Adam(self.sampling_policy.parameters(), lr=1e-4, weight_decay=1e-6)
-        # for i in range(density_epochs):
-        #     sample_indices = np.random.choice(
-        #             self.replay_buffer.size, self.replay_buffer.size)
-        #     np.random.shuffle(sample_indices)
-        #     ctr = 0
-        #     total_loss = 0
-        #     for j in range(0, self.replay_buffer.size, self.batch_size):
-        #         actions = self.replay_buffer.act_buf[sample_indices[ctr * self.batch_size:(
-        #                 ctr + 1) * self.batch_size],:]
-        #         actions = torch.FloatTensor(actions)
-        #         obs = self.replay_buffer.obs_buf[sample_indices[ctr * self.batch_size:(
-        #                 ctr + 1) * self.batch_size],:]
-        #         obs = torch.FloatTensor(obs)
-        #         density_optimizer.zero_grad()
-        #         loss = -self.sampling_policy.log_prob(actions,y=obs).mean()
-        #         loss.backward()
-        #         total_loss+=loss.data * self.batch_size
-        #         density_optimizer.step()
-        #         ctr+=1
+        density_epochs = 1000
+        self.sampling_policy = core.MADE(self.act_dim, 256, 3 , cond_label_size = self.obs_dim[0])
+        density_optimizer = torch.optim.Adam(self.sampling_policy.parameters(), lr=5e-4, weight_decay=1e-6)
+        for i in range(density_epochs):
+            sample_indices = np.random.choice(
+                    self.replay_buffer.size, self.replay_buffer.size)
+            np.random.shuffle(sample_indices)
+            ctr = 0
+            total_loss = 0
+            for j in range(0, self.replay_buffer.size, self.batch_size):
+                actions = self.replay_buffer.act_buf[sample_indices[ctr * self.batch_size:(
+                        ctr + 1) * self.batch_size],:]
+                actions = torch.FloatTensor(actions)
+                obs = self.replay_buffer.obs_buf[sample_indices[ctr * self.batch_size:(
+                        ctr + 1) * self.batch_size],:]
+                obs = torch.FloatTensor(obs)
+                density_optimizer.zero_grad()
+                loss = -self.sampling_policy.log_prob(actions,y=obs).mean()
+                loss.backward()
+                total_loss+=loss.data * self.batch_size
+                density_optimizer.step()
+                ctr+=1
                 
 
-        #     print("Density training loss: {}".format(total_loss/self.replay_buffer.size))
-        self.sampling_policy = core.MADE(self.act_dim, 256, 3 , cond_label_size = self.obs_dim[0])
-        self.sampling_policy.load_state_dict(torch.load("behavior_policies/"+self.env_name+".pt"))
-        # self.sampling_policy = torch.load("marginals/"+self.env_name+".pt")
+            print("Density training loss: {}".format(total_loss/self.replay_buffer.size))
 
-        # Prepare for interaction with environment
-        total_steps = self.epochs * self.steps_per_epoch
-        start_time = time.time()
-        o, ep_ret, ep_len = self.env.reset(), 0, 0
 
-        # Main loop: collect experience in env and update/log each epoch
-        for t in range(total_steps):
-
-            # # Update handling
-            batch = self.replay_buffer.sample_batch(self.batch_size)
-            self.update(data=batch, update_timestep = t)
-
-            # End of epoch handling
-            if (t+1) % self.steps_per_epoch == 0:
-                epoch = (t+1) // self.steps_per_epoch
-
-                # Save model
-                if (epoch % self.save_freq == 0) or (epoch == self.epochs):
-                    self.logger.save_state({'env': self.env}, None)
-
-                # Test the performance of the deterministic version of the agent.
-                self.test_agent()
-
-                # Log info about epoch
-                self.logger.log_tabular('Epoch', epoch)
-                self.logger.log_tabular('TestEpRet', with_min_and_max=True)
-                self.logger.log_tabular('TestEpLen', average_only=True)
-                self.logger.log_tabular('TotalUpdates', t)
-                self.logger.log_tabular('Q1Vals', with_min_and_max=True)
-                self.logger.log_tabular('Q2Vals', with_min_and_max=True)
-                self.logger.log_tabular('LossQ', average_only=True)
-                self.logger.log_tabular('Time', time.time()-start_time)
-                self.logger.dump_tabular()
-
+        # Save the behavior policy
+        print("Saving the behavior policy model to {}".format('behavior_policies/'+self.env_name))
+        torch.save(self.sampling_policy.state_dict(),'behavior_policies/'+self.env_name+'.pt')

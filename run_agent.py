@@ -1,7 +1,10 @@
 import sac
 from CQL.cql import CQL
+from CWR.cwr import CWR
 from EMAQ.emaq import EMAQ
+from EMAQ.learn_behavior_policy import EMAQ_LP
 from DT.dt import DT
+from DT.learn_marginal import DT_LM
 import argparse
 import gym
 
@@ -17,13 +20,21 @@ if __name__ == "__main__":
     env_fn = lambda:gym.make(args.env)
 
     if 'CQL' in args.algorithm:
-        agent = CQL(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
+        agent = CQL(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed,batch_size=256, algo=args.algorithm) 
     elif 'EMAQ' in args.algorithm:
-        agent = EMAQ(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
+        if 'learn-behavior-policy' in args.algorithm:
+            agent = EMAQ_LP(env_fn, env_name= args.env, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name},batch_size=256,  seed=args.seed, algo=args.algorithm) 
+        else:
+            agent = EMAQ(env_fn, env_name= args.env, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name},batch_size=256,  seed=args.seed, algo=args.algorithm) 
     elif 'DT' in args.algorithm:
-        agent = DT(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
+        if 'learn-marginal' in args.algorithm:
+            agent = DT_LM(env_fn, env_name= args.env, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, batch_size=256,  seed=args.seed, algo=args.algorithm) 
+        else:
+            agent = DT(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name},batch_size=256,  seed=args.seed, algo=args.algorithm) 
+    elif 'CWR' in args.algorithm:
+        agent = CWR(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name},batch_size=1024,  seed=args.seed, algo=args.algorithm)
     else:
-        agent = sac.SAC(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name}, seed=args.seed, algo=args.algorithm) 
+        agent = sac.SAC(env_fn, logger_kwargs={'output_dir':args.exp_name+'_s'+str(args.seed), 'exp_name':args.exp_name},batch_size=256, seed=args.seed, algo=args.algorithm) 
     
     agent.populate_replay_buffer()
     agent.run()

@@ -72,6 +72,20 @@ class SquashedGaussianMLPActor(nn.Module):
 
         return pi_action, logp_pi
 
+    def get_logprob(self,obs, actions):
+        net_out = self.net(obs)
+        mu = self.mu_layer(net_out)
+        log_std = self.log_std_layer(net_out)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(log_std)
+        pi_distribution = Normal(mu, std)
+        logp_pi = pi_distribution.log_prob(actions).sum(axis=-1)
+        logp_pi -= (2*(np.log(2) - actions - F.softplus(-2*actions))).sum(axis=1)
+
+        return logp_pi
+
+
+
 class MLPVFunction(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):

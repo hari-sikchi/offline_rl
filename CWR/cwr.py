@@ -8,8 +8,6 @@ import gym
 import time
 import core as core
 from utils.logx import EpochLogger
-from torch.autograd import Variable
-
 device = torch.device("cpu")
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class ReplayBuffer:
@@ -45,20 +43,13 @@ class ReplayBuffer:
 
 
 
-'''
-CQL variants
-cql-rho-fixedAlpha
-cql-rho-lagrange
-cql-H-fixedAlpha
-cql-H-lagrange
-'''
-class EMAQ:
+class CWR:
 
-    def __init__(self, env_fn, env_name=None, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=100, epochs=10000, replay_size=int(2000000), gamma=0.99, 
-        polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
+    def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(1500000), gamma=0.99, 
+        polyak=0.995, lr=3e-4, p_lr=3e-4, alpha=0.0, batch_size=1024, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, algo='CQL'):
+        logger_kwargs=dict(), save_freq=1, algo='SAC'):
         """
         Soft Actor-Critic (SAC)
 
@@ -190,19 +181,25 @@ class EMAQ:
         self.logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
         self.algo = algo
 
-        self.lagrange_threshold = 10
-        self.penalty_lr = 5e-2
-        self.lamda = Variable(torch.log(torch.exp(torch.Tensor([5]))-1), requires_grad=True)
-        self.lamda_optimizer = torch.optim.Adam([self.lamda],lr=self.penalty_lr)
-        self.tune_lambda = True if 'lagrange' in self.algo else False
-
-
-        self.alpha = 0 
-        self.target_update_freq = 1
-        self.p_lr = 3e-5
-        self.lr = 3e-4
-        self.n_samples = 100
-        self.env_name = env_name
+        self.p_lr = p_lr
+        self.lr = lr
+        self.alpha = 0
+        # # Algorithm specific hyperparams
+        # if 'CWR' in self.algo:
+        #     self.alpha = 0 # CWR does not require entropy in Q evaluation
+        #     self.target_update_freq = 100
+        #     self.p_lr = 1e-4
+        #     self.lr = 1e-4
+        # elif self.algo == 'CQL':
+        #     self.alpha = alpha # CWR does not require entropy in Q evaluation
+        #     self.target_update_freq = 1
+        #     self.p_lr = 3e-5
+        #     self.lr = 3e-4
+        # else:
+        #     self.alpha = alpha # CWR does not require entropy in Q evaluation
+        #     self.target_update_freq = 1
+        #     self.p_lr = 1e-3
+        #     self.lr = 1e-3
 
         # Set up optimizers for policy and q-function
         self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr)
@@ -220,6 +217,7 @@ class EMAQ:
         self.logger.setup_pytorch_saver(self.ac)
         print("Running Offline RL algorithm: {}".format(self.algo))
 
+
     def populate_replay_buffer(self):
         dataset = d4rl.qlearning_dataset(self.env)
         self.replay_buffer.obs_buf[:dataset['observations'].shape[0],:] = dataset['observations']
@@ -233,20 +231,6 @@ class EMAQ:
     def compute_loss_q(self, data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        sampled_actions_q1 = None
-        sampled_actions_q2 = None
-        for i in range(self.n_samples):
-            z = np.random.randn(a.shape[0],a.shape[1])
-            z = torch.FloatTensor(z)
-            actions, _ = self.sampling_policy.inverse(z,y=o2)
-            if sampled_actions_q1 is None:
-                sampled_actions_q1 = self.ac_targ.q1(o2,actions).view(-1,1)
-                sampled_actions_q2 = self.ac_targ.q2(o2,actions).view(-1,1)            
-            else:
-                sampled_actions_q1 = torch.cat((sampled_actions_q1,self.ac_targ.q1(o2,actions).view(-1,1)),dim=1)
-                sampled_actions_q2 = torch.cat((sampled_actions_q2,self.ac_targ.q2(o2,actions).view(-1,1)),dim=1)
-
-        
         q1 = self.ac.q1(o,a)
         q2 = self.ac.q2(o,a)
 
@@ -254,9 +238,10 @@ class EMAQ:
         with torch.no_grad():
             # Target actions come from *current* policy
             a2, logp_a2 = self.ac.pi(o2)
+
             # Target Q-values
-            q1_pi_targ = torch.max(sampled_actions_q1,dim=1).values
-            q2_pi_targ = torch.max(sampled_actions_q2,dim=1).values
+            q1_pi_targ = self.ac_targ.q1(o2, a2)
+            q2_pi_targ = self.ac_targ.q2(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha * logp_a2)
 
@@ -271,6 +256,69 @@ class EMAQ:
 
         return loss_q, q_info
 
+    # Set up function for computing SAC pi loss
+    def compute_loss_pi(self,data):
+        o = data['obs']
+        pi, logp_pi = self.ac.pi(o)
+        q1_pi = self.ac.q1(o, pi)
+        q2_pi = self.ac.q2(o, pi)
+        q_pi = torch.min(q1_pi, q2_pi)
+
+        # Entropy-regularized policy loss
+        if 'CWR' is self.algo:
+            beta = 1
+            v_pi = torch.min(q1_pi, q2_pi)
+            q1_old_actions = self.ac.q1(o, data['act'])
+            q2_old_actions = self.ac.q2(o, data['act'])
+            q_old_actions = torch.min(q1_old_actions,q2_old_actions)
+
+            adv_pi = q_old_actions - v_pi
+            # weights = adv_pi
+            # weights = torch.exp(torch.min(adv_pi/beta,torch.Tensor([np.log(20)])))
+            weights = F.softmax(adv_pi / beta, dim=0)
+            policy_logpp = self.ac.pi.get_logprob(o,data['act'])
+            loss_pi = (-policy_logpp * len(weights)*weights.detach()).mean()
+            # loss_pi = (-policy_logpp * weights.detach()).mean()
+
+
+        # if 'CWR' in self.algo:
+        #     # TODO: Check the number of samples used in paper
+        #     samples = 4
+        #     beta = 1
+        #     threshold = 20
+        #     # Sample actions for advantage calculation
+        #     q1_values = None
+        #     q2_values = None
+        #     for i in range(samples):
+        #         sample_action, _ = self.ac.pi(o)
+        #         if q1_values is None:
+        #             q1_values = self.ac.q1(o,sample_action).view(-1,1)
+        #             q2_values = self.ac.q2(o,sample_action).view(-1,1)
+        #         else:
+        #             q1_values = torch.cat((q1_values,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
+        #             q2_values = torch.cat((q2_values,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
+        #     if self.algo == 'CWR-exp': # Also known as AWAC
+        #         adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1)
+        #         adv_weight = torch.exp(torch.min(adv/beta,torch.Tensor([np.log(20)])))
+        #         loss_pi = -(logp_pi * adv_weight.detach()).mean()
+        #     elif self.algo == 'CWR-binary':
+        #         adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1).detach()
+        #         adv_weight = torch.max(adv, torch.tensor([0]).float())
+        #         loss_pi = -(logp_pi * adv_weight).mean()
+        #     elif self.algo == 'CWR-binary-max':
+        #         # import ipdb; ipdb.set_trace()
+        #         adv = q_pi - torch.max(torch.min(q1_values, q2_values),dim=1).values.detach()
+        #         adv_weight = torch.max(adv, torch.tensor([0]).float())
+        #         loss_pi = -(logp_pi * adv_weight).mean()
+        else:
+            loss_pi = (self.alpha * logp_pi - q_pi).mean()
+
+
+        # Useful info for logging
+        pi_info = dict(LogPi=logp_pi.detach().numpy())
+
+        return loss_pi, pi_info
+
 
 
     def update(self,data, update_timestep):
@@ -283,38 +331,36 @@ class EMAQ:
         # Record things
         self.logger.store(LossQ=loss_q.item(), **q_info)
 
+        # Freeze Q-networks so you don't waste computational effort 
+        # computing gradients for them during the policy learning step.
+        for p in self.q_params:
+            p.requires_grad = False
+
+        # Next run one gradient descent step for pi.
+        self.pi_optimizer.zero_grad()
+        loss_pi, pi_info = self.compute_loss_pi(data)
+        loss_pi.backward()
+        self.pi_optimizer.step()
+
+        # Unfreeze Q-networks so you can optimize it at next DDPG step.
+        for p in self.q_params:
+            p.requires_grad = True
+
+        # Record things
+        self.logger.store(LossPi=loss_pi.item(), **pi_info)
 
         # Finally, update target networks by polyak averaging.
-        if update_timestep%self.target_update_freq==0:
-            with torch.no_grad():
-                for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
-                    p_targ.data.mul_(self.polyak)
-                    p_targ.data.add_((1 - self.polyak) * p.data)
+ 
+        with torch.no_grad():
+            for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                p_targ.data.mul_(self.polyak)
+                p_targ.data.add_((1 - self.polyak) * p.data)
 
     def get_action(self, o, deterministic=False):
-        sampled_actions_q1 = None
-        sampled_actions_q2 = None
-        sampled_actions = []
-        o = torch.FloatTensor(o).view(1,-1)
-        for i in range(self.n_samples):
-            z = np.random.randn(1,self.act_dim)
-            z = torch.FloatTensor(z)
-            actions, _ = self.sampling_policy.inverse(z,y=o)
-            sampled_actions.append(actions)
-            if sampled_actions_q1 is None:
-                sampled_actions_q1 = self.ac.q1(o,actions).view(-1,1)
-                sampled_actions_q2 = self.ac.q2(o,actions).view(-1,1)            
-            else:
-                sampled_actions_q1 = torch.cat((sampled_actions_q1,self.ac.q1(o,actions).view(-1,1)),dim=1)
-                sampled_actions_q2 = torch.cat((sampled_actions_q2,self.ac.q2(o,actions).view(-1,1)),dim=1)
-
-        q_values = torch.min(sampled_actions_q1,sampled_actions_q2)
-        max_idx = torch.argmax(q_values.view(-1))
-        return sampled_actions[max_idx].detach().cpu().numpy()
-
-
+        return self.ac.act(torch.as_tensor(o, dtype=torch.float32), 
+                      deterministic)
 
     def test_agent(self):
         for j in range(self.num_test_episodes):
@@ -327,37 +373,6 @@ class EMAQ:
             self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
-
-        # Learn a generative model for data
-        # density_epochs = 50
-        # self.sampling_policy = core.MADE(self.act_dim, 256, 2 , cond_label_size = self.obs_dim[0])
-        # density_optimizer = torch.optim.Adam(self.sampling_policy.parameters(), lr=1e-4, weight_decay=1e-6)
-        # for i in range(density_epochs):
-        #     sample_indices = np.random.choice(
-        #             self.replay_buffer.size, self.replay_buffer.size)
-        #     np.random.shuffle(sample_indices)
-        #     ctr = 0
-        #     total_loss = 0
-        #     for j in range(0, self.replay_buffer.size, self.batch_size):
-        #         actions = self.replay_buffer.act_buf[sample_indices[ctr * self.batch_size:(
-        #                 ctr + 1) * self.batch_size],:]
-        #         actions = torch.FloatTensor(actions)
-        #         obs = self.replay_buffer.obs_buf[sample_indices[ctr * self.batch_size:(
-        #                 ctr + 1) * self.batch_size],:]
-        #         obs = torch.FloatTensor(obs)
-        #         density_optimizer.zero_grad()
-        #         loss = -self.sampling_policy.log_prob(actions,y=obs).mean()
-        #         loss.backward()
-        #         total_loss+=loss.data * self.batch_size
-        #         density_optimizer.step()
-        #         ctr+=1
-                
-
-        #     print("Density training loss: {}".format(total_loss/self.replay_buffer.size))
-        self.sampling_policy = core.MADE(self.act_dim, 256, 3 , cond_label_size = self.obs_dim[0])
-        self.sampling_policy.load_state_dict(torch.load("behavior_policies/"+self.env_name+".pt"))
-        # self.sampling_policy = torch.load("marginals/"+self.env_name+".pt")
-
         # Prepare for interaction with environment
         total_steps = self.epochs * self.steps_per_epoch
         start_time = time.time()
@@ -388,7 +403,10 @@ class EMAQ:
                 self.logger.log_tabular('TotalUpdates', t)
                 self.logger.log_tabular('Q1Vals', with_min_and_max=True)
                 self.logger.log_tabular('Q2Vals', with_min_and_max=True)
+                self.logger.log_tabular('LogPi', with_min_and_max=True)
+                self.logger.log_tabular('LossPi', average_only=True)
                 self.logger.log_tabular('LossQ', average_only=True)
                 self.logger.log_tabular('Time', time.time()-start_time)
                 self.logger.dump_tabular()
+
 
