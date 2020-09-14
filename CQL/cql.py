@@ -13,7 +13,7 @@ from torch.autograd import Variable
 device = torch.device("cpu")
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class ReplayBuffer:
-    """
+    """ 
     A simple FIFO experience replay buffer for SAC agents.
     """
 
@@ -55,10 +55,10 @@ cql-H-lagrange
 class CQL:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=100, epochs=10000, replay_size=int(1500000), gamma=0.99, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(2000000), gamma=0.99, 
         polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, algo='CQL'):
+        logger_kwargs=dict(), save_freq=1, algo='CQL', automatic_alpha_tuning=False):
         """
         Soft Actor-Critic (SAC)
 
@@ -196,8 +196,15 @@ class CQL:
         self.lamda_optimizer = torch.optim.Adam([self.lamda],lr=self.penalty_lr)
         self.tune_lambda = True if 'lagrange' in self.algo else False
 
-
-        self.alpha = alpha # CWR does not require entropy in Q evaluation
+        self.automatic_alpha_tuning = automatic_alpha_tuning
+        if self.automatic_alpha_tuning is True:
+            self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape)).item()
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+            self.alpha_optim = Adam([self.log_alpha], lr=lr)
+            self.alpha = self.log_alpha.exp()
+        else:
+            self.alpha = alpha
+        # self.alpha = alpha # CWR does not require entropy in Q evaluation
         self.target_update_freq = 1
         self.p_lr = 3e-5
         self.lr = 3e-4
@@ -229,6 +236,7 @@ class CQL:
         self.replay_buffer.done_buf[:dataset['terminals'].shape[0]] = dataset['terminals']
         self.replay_buffer.size = dataset['observations'].shape[0]
         self.replay_buffer.ptr = (self.replay_buffer.size+1)%(self.replay_buffer.max_size)
+
     # Set up function for computing SAC Q-losses
     def compute_loss_q(self, data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
@@ -364,7 +372,7 @@ class CQL:
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().numpy())
 
-        return loss_pi, pi_info
+        return loss_pi, pi_info, logp_pi
 
 
 
@@ -394,9 +402,19 @@ class CQL:
 
         # Next run one gradient descent step for pi.
         self.pi_optimizer.zero_grad()
-        loss_pi, pi_info = self.compute_loss_pi(data)
+        loss_pi, pi_info, log_pi = self.compute_loss_pi(data)
         loss_pi.backward()
         self.pi_optimizer.step()
+
+
+        if self.automatic_alpha_tuning:
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+
+            self.alpha = self.log_alpha.exp()
 
         # Unfreeze Q-networks so you can optimize it at next DDPG step.
         for p in self.q_params:

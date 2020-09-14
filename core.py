@@ -11,6 +11,8 @@ import math
 import argparse
 import pprint
 import copy
+# import CWR.awac_core as awac_core
+
 
 device = torch.device("cpu")
 def combined_shape(length, shape=None):
@@ -86,6 +88,73 @@ class SquashedGaussianMLPActor(nn.Module):
 
 
 
+
+class awacMLPActor(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
+        super().__init__()
+        self.net = mlp([obs_dim] + list(hidden_sizes), activation, activation)
+        self.mu_layer = nn.Linear(hidden_sizes[-1], act_dim)
+
+        self.log_std_logits = nn.Parameter(
+                    torch.zeros(act_dim, requires_grad=True))
+        self.min_log_std = -6
+        self.max_log_std = 0
+        # self.log_std_layer = nn.Linear(hidden_sizes[-1], act_dim)
+        self.act_limit = act_limit
+
+    def forward(self, obs, deterministic=False, with_logprob=True):
+        # print("Using the special policy")
+        net_out = self.net(obs)
+        mu = self.mu_layer(net_out)
+        mu = torch.tanh(mu) * self.act_limit
+
+        log_std = torch.sigmoid(self.log_std_logits)
+        
+        log_std = self.min_log_std + log_std * (
+                        self.max_log_std - self.min_log_std)
+        std = torch.exp(log_std)
+        # print("Std: {}".format(std))
+
+        # Pre-squash distribution and sample
+        pi_distribution = Normal(mu, std)
+        if deterministic:
+            # Only used for evaluating policy at test time.
+            pi_action = mu
+        else:
+            pi_action = pi_distribution.rsample()
+
+        if with_logprob:
+            # Compute logprob from Gaussian, and then apply correction for Tanh squashing.
+            # NOTE: The correction formula is a little bit magic. To get an understanding 
+            # of where it comes from, check out the original SAC paper (arXiv 1801.01290) 
+            # and look in appendix C. This is a more numerically-stable equivalent to Eq 21.
+            # Try deriving it yourself as a (very difficult) exercise. :)
+            logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+            # logp_pi -= (2*(np.log(2) - pi_action - F.softplus(-2*pi_action))).sum(axis=1)
+        else:
+            logp_pi = None
+
+
+        return pi_action, logp_pi
+
+    def get_logprob(self,obs, actions):
+        net_out = self.net(obs)
+        mu = self.mu_layer(net_out)
+        mu = torch.tanh(mu) * self.act_limit
+        log_std = torch.sigmoid(self.log_std_logits)
+        # log_std = self.log_std_layer(net_out)
+        log_std = self.min_log_std + log_std * (
+                        self.max_log_std - self.min_log_std)
+        std = torch.exp(log_std)
+        pi_distribution = Normal(mu, std)
+        logp_pi = pi_distribution.log_prob(actions).sum(axis=-1)
+
+        return logp_pi
+
+
+
+
 class MLPVFunction(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
@@ -109,14 +178,18 @@ class MLPQFunction(nn.Module):
 class MLPActorCritic(nn.Module):
 
     def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
-                 activation=nn.ReLU):
+                 activation=nn.ReLU, special_policy=None):
         super().__init__()
 
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         act_limit = action_space.high[0]
         # build policy and value functions
-        self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit).to(device)
+        if special_policy is 'awac':
+            self.pi = awacMLPActor(obs_dim, act_dim, (256,256,256,256), activation, act_limit).to(device)
+            # self.pi = awac_core.GaussianPolicy([256,256,256,256],obs_dim, act_dim, max_log_std=0, min_log_std=-6, std_architecture="values")
+        else:
+            self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit).to(device)
         self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
         self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
         self.v = MLPVFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)

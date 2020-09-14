@@ -8,8 +8,12 @@ import gym
 import time
 import core as core
 from utils.logx import EpochLogger
+import torch.nn.functional as F
+
+
 device = torch.device("cpu")
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer for SAC agents.
@@ -32,8 +36,10 @@ class ReplayBuffer:
         self.ptr = (self.ptr+1) % self.max_size
         self.size = min(self.size+1, self.max_size)
 
-    def sample_batch(self, batch_size=32):
-        idxs = np.random.randint(0, self.size, size=batch_size)
+    def sample_batch(self, batch_size=32, idxs=None):
+        if idxs is None:
+            idxs = np.random.randint(0, self.size, size=batch_size)
+
         batch = dict(obs=self.obs_buf[idxs],
                      obs2=self.obs2_buf[idxs],
                      act=self.act_buf[idxs],
@@ -46,7 +52,7 @@ class ReplayBuffer:
 class CWR:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=100, epochs=10000, replay_size=int(1500000), gamma=0.99, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(2000000), gamma=0.99, 
         polyak=0.995, lr=3e-4, p_lr=3e-4, alpha=0.0, batch_size=1024, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1, algo='SAC'):
@@ -161,7 +167,7 @@ class CWR:
         self.act_limit = self.env.action_space.high[0]
 
         # Create actor-critic module and target networks
-        self.ac = actor_critic(self.env.observation_space, self.env.action_space, **ac_kwargs)
+        self.ac = actor_critic(self.env.observation_space, self.env.action_space, special_policy='awac', **ac_kwargs)
         self.ac_targ = deepcopy(self.ac)
         self.gamma  = gamma
 
@@ -185,24 +191,9 @@ class CWR:
         self.lr = lr
         self.alpha = 0
         # # Algorithm specific hyperparams
-        # if 'CWR' in self.algo:
-        #     self.alpha = 0 # CWR does not require entropy in Q evaluation
-        #     self.target_update_freq = 100
-        #     self.p_lr = 1e-4
-        #     self.lr = 1e-4
-        # elif self.algo == 'CQL':
-        #     self.alpha = alpha # CWR does not require entropy in Q evaluation
-        #     self.target_update_freq = 1
-        #     self.p_lr = 3e-5
-        #     self.lr = 3e-4
-        # else:
-        #     self.alpha = alpha # CWR does not require entropy in Q evaluation
-        #     self.target_update_freq = 1
-        #     self.p_lr = 1e-3
-        #     self.lr = 1e-3
 
         # Set up optimizers for policy and q-function
-        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr)
+        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr, weight_decay=1e-4)
         self.q_optimizer = Adam(self.q_params, lr=self.lr)
         self.num_test_episodes = num_test_episodes
         self.max_ep_len = max_ep_len
@@ -220,13 +211,21 @@ class CWR:
 
     def populate_replay_buffer(self):
         dataset = d4rl.qlearning_dataset(self.env)
-        self.replay_buffer.obs_buf[:dataset['observations'].shape[0],:] = dataset['observations']
-        self.replay_buffer.act_buf[:dataset['actions'].shape[0],:] = dataset['actions']
-        self.replay_buffer.obs2_buf[:dataset['next_observations'].shape[0],:] = dataset['next_observations']
-        self.replay_buffer.rew_buf[:dataset['rewards'].shape[0]] = dataset['rewards']
-        self.replay_buffer.done_buf[:dataset['terminals'].shape[0]] = dataset['terminals']
-        self.replay_buffer.size = dataset['observations'].shape[0]
-        self.replay_buffer.ptr = (self.replay_buffer.size+1)%(self.replay_buffer.max_size)
+        N = dataset['rewards'].shape[0]
+        for i in range(N):
+            self.replay_buffer.store(dataset['observations'][i],dataset['actions'][i],dataset['rewards'][i],dataset['next_observations'][i],float(dataset['terminals'][i]))
+        print("Loaded dataset")
+        
+        # self.replay_buffer.obs_buf[:dataset['observations'].shape[0],:] = dataset['observations']
+        # self.replay_buffer.act_buf[:dataset['actions'].shape[0],:] = dataset['actions']
+        # self.replay_buffer.obs2_buf[:dataset['next_observations'].shape[0],:] = dataset['next_observations']
+        # self.replay_buffer.rew_buf[:dataset['rewards'].shape[0]] = dataset['rewards']
+        # self.replay_buffer.done_buf[:dataset['terminals'].shape[0]] = dataset['terminals']
+        # self.replay_buffer.size = dataset['observations'].shape[0]
+        # self.replay_buffer.ptr = (self.replay_buffer.size+1)%(self.replay_buffer.max_size)
+        # print("Size of dataset: {}".format(dataset['observations'].shape[0]))
+        # import ipdb; ipdb.set_trace()
+    
     # Set up function for computing SAC Q-losses
     def compute_loss_q(self, data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
@@ -259,63 +258,24 @@ class CWR:
     # Set up function for computing SAC pi loss
     def compute_loss_pi(self,data):
         o = data['obs']
+
         pi, logp_pi = self.ac.pi(o)
         q1_pi = self.ac.q1(o, pi)
         q2_pi = self.ac.q2(o, pi)
-        q_pi = torch.min(q1_pi, q2_pi)
+        v_pi = torch.min(q1_pi, q2_pi)
 
-        # Entropy-regularized policy loss
-        if 'CWR' is self.algo:
-            beta = 1
-            v_pi = torch.min(q1_pi, q2_pi)
-            q1_old_actions = self.ac.q1(o, data['act'])
-            q2_old_actions = self.ac.q2(o, data['act'])
-            q_old_actions = torch.min(q1_old_actions,q2_old_actions)
+        beta = 2
+        q1_old_actions = self.ac.q1(o, data['act'])
+        q2_old_actions = self.ac.q2(o, data['act'])
+        q_old_actions = torch.min(q1_old_actions, q2_old_actions)
 
-            adv_pi = q_old_actions - v_pi
-            # weights = adv_pi
-            # weights = torch.exp(torch.min(adv_pi/beta,torch.Tensor([np.log(20)])))
-            weights = F.softmax(adv_pi / beta, dim=0)
-            policy_logpp = self.ac.pi.get_logprob(o,data['act'])
-            loss_pi = (-policy_logpp * len(weights)*weights.detach()).mean()
-            # loss_pi = (-policy_logpp * weights.detach()).mean()
-
-
-        # if 'CWR' in self.algo:
-        #     # TODO: Check the number of samples used in paper
-        #     samples = 4
-        #     beta = 1
-        #     threshold = 20
-        #     # Sample actions for advantage calculation
-        #     q1_values = None
-        #     q2_values = None
-        #     for i in range(samples):
-        #         sample_action, _ = self.ac.pi(o)
-        #         if q1_values is None:
-        #             q1_values = self.ac.q1(o,sample_action).view(-1,1)
-        #             q2_values = self.ac.q2(o,sample_action).view(-1,1)
-        #         else:
-        #             q1_values = torch.cat((q1_values,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
-        #             q2_values = torch.cat((q2_values,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
-        #     if self.algo == 'CWR-exp': # Also known as AWAC
-        #         adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1)
-        #         adv_weight = torch.exp(torch.min(adv/beta,torch.Tensor([np.log(20)])))
-        #         loss_pi = -(logp_pi * adv_weight.detach()).mean()
-        #     elif self.algo == 'CWR-binary':
-        #         adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1).detach()
-        #         adv_weight = torch.max(adv, torch.tensor([0]).float())
-        #         loss_pi = -(logp_pi * adv_weight).mean()
-        #     elif self.algo == 'CWR-binary-max':
-        #         # import ipdb; ipdb.set_trace()
-        #         adv = q_pi - torch.max(torch.min(q1_values, q2_values),dim=1).values.detach()
-        #         adv_weight = torch.max(adv, torch.tensor([0]).float())
-        #         loss_pi = -(logp_pi * adv_weight).mean()
-        else:
-            loss_pi = (self.alpha * logp_pi - q_pi).mean()
-
+        adv_pi = q_old_actions - v_pi
+        weights = F.softmax(adv_pi / beta, dim=0)
+        policy_logpp = self.ac.pi.get_logprob(o, data['act'])
+        loss_pi = (-policy_logpp * len(weights)*weights.detach()).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().numpy())
+        pi_info = dict(LogPi=policy_logpp.detach().numpy())
 
         return loss_pi, pi_info
 
@@ -330,7 +290,6 @@ class CWR:
 
         # Record things
         self.logger.store(LossQ=loss_q.item(), **q_info)
-
         # Freeze Q-networks so you don't waste computational effort 
         # computing gradients for them during the policy learning step.
         for p in self.q_params:
@@ -350,7 +309,6 @@ class CWR:
         self.logger.store(LossPi=loss_pi.item(), **pi_info)
 
         # Finally, update target networks by polyak averaging.
- 
         with torch.no_grad():
             for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
                 # NB: We use an in-place operations "mul_", "add_" to update target
@@ -370,10 +328,11 @@ class CWR:
                 o, r, d, _ = self.test_env.step(self.get_action(o, True))
                 ep_ret += r
                 ep_len += 1
-            self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
+            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            # self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
-        # Prepare for interaction with environment
+       # Prepare for interaction with environment
         total_steps = self.epochs * self.steps_per_epoch
         start_time = time.time()
         o, ep_ret, ep_len = self.env.reset(), 0, 0
