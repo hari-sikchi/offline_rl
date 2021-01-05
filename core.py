@@ -12,9 +12,9 @@ import argparse
 import pprint
 import copy
 # import CWR.awac_core as awac_core
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-device = torch.device("cpu")
+# device = torch.device("cpu")
 def combined_shape(length, shape=None):
     if shape is None:
         return (length,)
@@ -73,6 +73,12 @@ class SquashedGaussianMLPActor(nn.Module):
         pi_action = self.act_limit * pi_action
 
         return pi_action, logp_pi
+
+    def get_mean_logstd(self,obs):
+        net_out = self.net(obs)
+        mu = self.mu_layer(net_out)
+        log_std = self.log_std_layer(net_out)
+        return mu,log_std
 
     def get_logprob(self,obs, actions):
         net_out = self.net(obs)
@@ -167,13 +173,31 @@ class MLPVFunction(nn.Module):
 
 class MLPQFunction(nn.Module):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, output_size=1):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+        if(output_size>1):
+            self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [5], activation)    
+        else:
+            self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs, act):
         q = self.q(torch.cat([obs, act], dim=-1))
         return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+
+
+class MLPQRankFunction(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, output_size=1):
+        super().__init__()
+        self.q_i = mlp([obs_dim + act_dim] + list(hidden_sizes), activation)
+        self.q_j = mlp([hidden_sizes[-1]]+[1],activation)
+        # self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+
+    def forward(self, obs, act):
+        q_i_out = self.q_i(torch.cat([obs, act], dim=-1))
+        q = self.q_j(q_i_out)
+        return q_i_out, torch.squeeze(q, -1) # Critical to ensure q has right shape.
+
 
 class MLPActorCritic(nn.Module):
 
@@ -188,10 +212,25 @@ class MLPActorCritic(nn.Module):
         if special_policy is 'awac':
             self.pi = awacMLPActor(obs_dim, act_dim, (256,256,256,256), activation, act_limit).to(device)
             # self.pi = awac_core.GaussianPolicy([256,256,256,256],obs_dim, act_dim, max_log_std=0, min_log_std=-6, std_architecture="values")
+        elif special_policy is 'two_timescale':
+            self.horizon_q1 = MLPQFunction(obs_dim+1, act_dim, hidden_sizes, activation).to(device)
+            self.horizon_q2 = MLPQFunction(obs_dim+1, act_dim, hidden_sizes, activation).to(device)
+            self.pi = SquashedGaussianMLPActor(obs_dim+1, act_dim, hidden_sizes, activation, act_limit).to(device)
+        elif special_policy is 'cql_dagger':
+            self.pi =  awacMLPActor(obs_dim, act_dim, (256,256), activation, act_limit).to(device)
         else:
             self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit).to(device)
-        self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
-        self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
+        
+        
+        if special_policy is 'vectorQ':
+            self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes,  activation,output_size=5).to(device)
+            self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation, output_size=5).to(device)
+        if special_policy is 'awac':
+            self.q1 = MLPQRankFunction(obs_dim, act_dim, hidden_sizes,  activation,output_size=5).to(device)
+            self.q2 = MLPQRankFunction(obs_dim, act_dim, hidden_sizes, activation, output_size=5).to(device)
+        else:            
+            self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
+            self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
         self.v = MLPVFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
 
 
