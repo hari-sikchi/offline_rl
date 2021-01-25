@@ -1,5 +1,25 @@
 # Offline RL Algorithms
 
+This repository aims to provide a simple PyTorch implementation of state-of-the-art Offline RL methods. Some of the methods like AWAC, CQL, MOPO have been tested on MuJoCo locomotion tasks based on d4rl dataset.
+
+
+## Installation
+* Mujoco
+* PyTorch
+* d4rl(https://github.com/rail-berkeley/d4rl)
+* gym 
+
+
+As an alternative, to replicate the environment used for running the code (might contain a lot of unnecessary libraries as well):   
+```
+pip install environment/requirements.txt 
+```
+
+or via conda    
+```
+cd environment
+conda create --name <env> --file environment/requirements_conda.txt
+```
 
 ## Running the code
 
