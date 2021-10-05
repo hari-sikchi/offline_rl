@@ -1,6 +1,6 @@
 # Offline RL Algorithms
 
-This repository aims to provide a simple PyTorch implementation of state-of-the-art Offline RL methods. Some of the methods like AWAC, CQL, MOPO have been tested on MuJoCo locomotion tasks based on d4rl dataset.
+This repository aims to provide a simple PyTorch implementation of state-of-the-art Offline RL methods. Some of the methods like AWAC, CQL have been tested on MuJoCo locomotion tasks based on d4rl dataset.
 
 
 ## Installation
@@ -37,19 +37,10 @@ python run_agent.py --env <env_name>  --seed <seed_no>  --exp_name <experiment n
 * 'CWR-binary': Critic weighted regression (binary filtering)
 * 'CWR-binary-max': Critic weighted regression (binary filtering with pessimistic advantage estimates)
 * 'EMAQ': Expected Max Q learning operator
-* 'MOPO': Model based Offline Policy Optimization
 
 
 
 
-## Algorithm specific details
-
-* MOPO   
-MOPO takes two additional arguments:   
-```
---lamda_pessimism <value>: the amount of pessimism wrt uncertainty
---rollout_length <value>: length of imagined rollout
-```
 
 
 
