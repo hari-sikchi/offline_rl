@@ -6,12 +6,13 @@ from torch.optim import Adam
 import d4rl
 import gym
 import time
-import core as core
+import CQL.cql_core as core
 from utils.logx import EpochLogger
 from torch.autograd import Variable
+import pickle
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-device = torch.device("cpu")
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class ReplayBuffer:
     """ 
     A simple FIFO experience replay buffer for SAC agents.
@@ -41,7 +42,7 @@ class ReplayBuffer:
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
                      done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32).to(device) for k,v in batch.items()}
 
 
 
@@ -55,10 +56,10 @@ cql-H-lagrange
 class CQL:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=1000, epochs=3000, replay_size=int(2e6), gamma=0.99, 
+        steps_per_epoch=1000, epochs=10000, replay_size=int(2e6), gamma=0.99, 
         polyak=0.995, lr=3e-4, p_lr=1e-4, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, algo='CQL', automatic_alpha_tuning=False):
+        logger_kwargs=dict(), save_freq=1,policy_eval_start=0, algo='CQL',min_q_weight=5, automatic_alpha_tuning=False):
         """
         Soft Actor-Critic (SAC)
 
@@ -192,15 +193,22 @@ class CQL:
 
         self.lagrange_threshold = 10
         self.penalty_lr = lr
-        self.lamda = Variable(torch.log(torch.exp(torch.Tensor([5]))-1), requires_grad=True)
-        self.lamda_optimizer = torch.optim.Adam([self.lamda],lr=self.penalty_lr)
         self.tune_lambda = True if 'lagrange' in self.algo else False
-
+        if self.tune_lambda:
+            print("Tuning Lambda")
+            self.target_action_gap = self.lagrange_threshold
+            self.log_lamda = torch.zeros(1, requires_grad=True, device=device)
+            self.lamda_optimizer = torch.optim.Adam([self.log_lamda],lr=self.penalty_lr)
+            self.lamda = self.log_lamda.exp()
+            # self.min_q_weight = 1.0
+        else:            
+            self.lamda = min_q_weight
+            # self.min_q_weight = min_q_weight
         self.automatic_alpha_tuning = automatic_alpha_tuning
         if self.automatic_alpha_tuning is True:
             self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape)).item()
             self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-            self.alpha_optim = Adam([self.log_alpha], lr=lr)
+            self.alpha_optim = Adam([self.log_alpha], lr=p_lr)
             self.alpha = self.log_alpha.exp()
         else:
             self.alpha = alpha
@@ -222,10 +230,15 @@ class CQL:
         self.batch_size = batch_size
         self.save_freq = save_freq
         self.polyak = polyak
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.softplus = torch.nn.Softplus(beta=1, threshold=20)
+        self.policy_eval_start=policy_eval_start
+        self._current_epoch=0
+        
         # Set up model saving
         self.logger.setup_pytorch_saver(self.ac)
         print("Running Offline RL algorithm: {}".format(self.algo))
-        print("Initialized CQL-alpha to {}".format(self.lamda.data[0]))
+
 
     def populate_replay_buffer(self):
         dataset = d4rl.qlearning_dataset(self.env)
@@ -261,8 +274,7 @@ class CQL:
         loss_q = loss_q1 + loss_q2
 
 
-        cql_alpha = torch.nn.functional.softplus(self.lamda).data[0]
-        self.logger.store(CQLalpha=cql_alpha)
+        self.logger.store(CQLalpha=self.lamda)
         if 'rho' in self.algo:
             samples = 10
             # Sample from previous policy (10 samples)
@@ -311,56 +323,48 @@ class CQL:
             q2_next_pi_samples = q2_next_pi_samples.view((o2.shape[0],-1))
 
 
-            # import ipdb; ipdb.set_trace()
-
-            # for sample in range(samples):
-            #     sample_action, logpi = self.ac.pi(o)
-            #     if q1_pi_samples is None:
-            #         q1_pi_samples = self.ac.q1(o,sample_action).view(-1,1) - logpi.view(-1,1)
-            #         q2_pi_samples = self.ac.q2(o,sample_action).view(-1,1) - logpi.view(-1,1)
-            #     else:
-            #         q1_pi_samples = torch.cat((q1_pi_samples,self.ac.q1(o,sample_action).view(-1,1) - logpi.view(-1,1) ),dim=1)
-            #         q2_pi_samples = torch.cat((q2_pi_samples,self.ac.q2(o,sample_action).view(-1,1) - logpi.view(-1,1) ),dim=1)
-            
             # Add samples from uniform sampling
             sample_action = np.random.uniform(low=self.env.action_space.low,high=self.env.action_space.high,size=(q1_pi_samples.shape[0]*10,self.env.action_space.high.shape[0]))
-            sample_action = torch.FloatTensor(sample_action)
-            log_pi = torch.FloatTensor([np.log(1/np.prod(self.env.action_space.high-self.env.action_space.low))])
+            sample_action = torch.FloatTensor(sample_action).to(device)
+            log_pi = torch.FloatTensor([np.log(1/np.prod(self.env.action_space.high-self.env.action_space.low))]).to(device)
 
 
             q1_rand_samples = self.ac.q1(o_rep,sample_action).view(-1,1) - log_pi.view(-1,1).detach()
             q2_rand_samples = self.ac.q2(o_rep,sample_action).view(-1,1) - log_pi.view(-1,1).detach()
-            #-torch.FloatTensor([np.log(2*samples)])
 
 
             q1_rand_samples = q1_rand_samples.view((o.shape[0],-1))
             q2_rand_samples = q2_rand_samples.view((o.shape[0],-1))
             
-            cql_loss_q1 = torch.logsumexp(torch.cat([q1_pi_samples,q1_next_pi_samples,q1_rand_samples],dim=1),dim=1).mean() 
-            cql_loss_q2 = torch.logsumexp(torch.cat((q2_pi_samples,q2_next_pi_samples,q2_rand_samples),dim=1),dim=1).mean() 
+            cql_loss_q1 = torch.logsumexp(torch.cat([q1_pi_samples,q1_next_pi_samples,q1_rand_samples],dim=1),dim=1).mean()*self.lamda 
+            cql_loss_q2 = torch.logsumexp(torch.cat((q2_pi_samples,q2_next_pi_samples,q2_rand_samples),dim=1),dim=1).mean()*self.lamda
 
 
-            # for sample in range(samples):
-            #     sample_action = np.random.uniform(low=self.env.action_space.low,high=self.env.action_space.high,size=(q1_pi_samples.shape[0],self.env.action_space.high.shape[0]))
-            #     sample_action = torch.FloatTensor(sample_action)
-            #     log_pi = np.log(1/np.prod(self.env.action_space.high-self.env.action_space.low))
-            #     q1_pi_samples = torch.cat((q1_pi_samples,self.ac.q1(o,sample_action).view(-1,1) - log_pi.view(-1,1) ),dim=1)
-            #     q2_pi_samples = torch.cat((q2_pi_samples,self.ac.q2(o,sample_action).view(-1,1) - log_pi.view(-1,1) ),dim=1)
-            # cql_loss_q1 = q1_pi_samples-np.log(2*samples)
-            # cql_loss_q2 = q2_pi_samples-np.log(2*samples)
-            # cql_loss_q1 = torch.logsumexp(cql_loss_q1,dim=1).mean()
-            # cql_loss_q2 = torch.logsumexp(cql_loss_q2,dim=1).mean()
             
             # Sample from dataset
-            cql_loss_q1 -= self.ac.q1(o, a).mean()
-            cql_loss_q2 -= self.ac.q2(o, a).mean()
+            cql_loss_q1 -= self.ac.q1(o, a).mean()*self.lamda
+            cql_loss_q2 -= self.ac.q2(o, a).mean()*self.lamda
+
+            # Update the cql-alpha
+            if 'lagrange' in self.algo:
+                cql_alpha = torch.clamp(self.log_lamda.exp(), min=0.0, max=1000000.0)
+                self.lamda = cql_alpha
+                cql_loss_q1 = cql_alpha*(cql_loss_q1-self.target_action_gap)
+                cql_loss_q2 = cql_alpha*(cql_loss_q2-self.target_action_gap)
+                
+                self.lamda_optimizer.zero_grad()
+                lamda_loss = (-cql_loss_q1-cql_loss_q2)*0.5
+                lamda_loss.backward(retain_graph=True)
+                self.lamda_optimizer.step()
+                # print(self.log_lamda.exp())
+
             avg_q = 0.5*(cql_loss_q1.mean() + cql_loss_q2.mean()).detach().cpu()
-            loss_q += cql_alpha*(cql_loss_q1.mean() + cql_loss_q2.mean())
+            loss_q += (cql_loss_q1.mean() + cql_loss_q2.mean())
 
 
         # Useful info for logging
-        q_info = dict(Q1Vals=q1.detach().numpy(),
-                      Q2Vals=q2.detach().numpy(),
+        q_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                      Q2Vals=q2.detach().cpu().numpy(),
                       AvgQ = avg_q)
 
         return loss_q, q_info
@@ -368,68 +372,34 @@ class CQL:
     # Set up function for computing SAC pi loss
     def compute_loss_pi(self,data):
         o = data['obs']
+        a = data['act']
         pi, logp_pi = self.ac.pi(o)
         q1_pi = self.ac.q1(o, pi)
         q2_pi = self.ac.q2(o, pi)
         q_pi = torch.min(q1_pi, q2_pi)
 
-        # Entropy-regularized policy loss
-        if 'CWR' in self.algo:
-            # TODO: Check the number of samples used in paper
-            samples = 4
-            beta = 1
-            threshold = 20
-            # Sample actions for advantage calculation
-            q1_values = None
-            q2_values = None
-            for i in range(samples):
-                sample_action, _ = self.ac.pi(o)
-                if q1_values is None:
-                    q1_values = self.ac.q1(o,sample_action).view(-1,1)
-                    q2_values = self.ac.q2(o,sample_action).view(-1,1)
-                else:
-                    q1_values = torch.cat((q1_values,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
-                    q2_values = torch.cat((q2_values,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
-            if self.algo == 'CWR-exp': # Also known as AWAC
-                adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1)
-                adv_weight = torch.exp(torch.min(adv/beta,torch.Tensor([np.log(20)])))
-                loss_pi = -(logp_pi * adv_weight.detach()).mean()
-            elif self.algo == 'CWR-binary':
-                adv = q_pi - torch.mean(torch.min(q1_values, q2_values),dim=1).detach()
-                adv_weight = torch.max(adv, torch.tensor([0]).float())
-                loss_pi = -(logp_pi * adv_weight).mean()
-            elif self.algo == 'CWR-binary-max':
-                # import ipdb; ipdb.set_trace()
-                adv = q_pi - torch.max(torch.min(q1_values, q2_values),dim=1).values.detach()
-                adv_weight = torch.max(adv, torch.tensor([0]).float())
-                loss_pi = -(logp_pi * adv_weight).mean()
-        else:
-            loss_pi = (self.alpha * logp_pi - q_pi).mean()
+        loss_pi = (self.alpha * logp_pi - q_pi).mean()
 
+        # TODO: Verify if this is needed
+        if self._current_epoch<self.policy_eval_start:
+            policy_log_prob = self.ac.pi.get_logprob(o, a)
+            loss_pi = (self.alpha * logp_pi - policy_log_prob).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().numpy())
+        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
 
         return loss_pi, pi_info, logp_pi
 
 
 
     def update(self,data, update_timestep):
+        self._current_epoch+=1
         # First run one gradient descent step for Q1 and Q2
         self.q_optimizer.zero_grad()
         loss_q, q_info = self.compute_loss_q(data)
         loss_q.backward()
         self.q_optimizer.step()
 
-
-        # Update the cql-alpha
-        if 'lagrange' in self.algo:
-            cql_alpha = torch.clamp(torch.nn.functional.softplus(self.lamda), min=0.0, max=1000000.0)
-
-            self.lamda_optimizer.zero_grad()
-            lamda_loss = -(q_info['AvgQ']-self.lagrange_threshold)*cql_alpha
-            lamda_loss.backward()
-            self.lamda_optimizer.step()
 
         # Record things
         self.logger.store(LossQ=loss_q.item(), **q_info)
@@ -472,7 +442,7 @@ class CQL:
                     p_targ.data.add_((1 - self.polyak) * p.data)
 
     def get_action(self, o, deterministic=False):
-        return self.ac.act(torch.as_tensor(o, dtype=torch.float32), 
+        return self.ac.act(torch.as_tensor(o, dtype=torch.float32).to(device), 
                       deterministic)
 
     def test_agent(self):
@@ -483,7 +453,8 @@ class CQL:
                 o, r, d, _ = self.test_env.step(self.get_action(o, True))
                 ep_ret += r
                 ep_len += 1
-            self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
+            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            # self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
 
     def run(self):
         # Prepare for interaction with environment
@@ -522,4 +493,40 @@ class CQL:
                 self.logger.log_tabular('CQLalpha', average_only=True)
                 self.logger.log_tabular('Time', time.time()-start_time)
                 self.logger.dump_tabular()
+
+
+
+    def train(self, training_epochs):
+        # Main loop: collect experience in env and update/log each epoch
+        for t in range(training_epochs):
+            # # Update handling
+            batch = self.replay_buffer.sample_batch(self.batch_size)
+            self.update(data=batch, update_timestep = t)
+
+        self.test_agent()
+
+    def collect_episodes(self, num_episodes):
+        env_steps = 0
+        for j in range(num_episodes):
+            o, d, ep_ret, ep_len = self.env.reset(), False, 0, 0
+            while not(d or (ep_len == self.max_ep_len)):
+                # Take deterministic actions at test time 
+                act = self.get_action(o)
+                no, r, d, _ = self.env.step(act)
+                self.replay_buffer.store(o,act,r,no,d)
+                env_steps+=1
+        return env_steps       
+
+
+    def log_and_dump(self):
+        # Log info about epoch
+        self.logger.log_tabular('TestEpRet', with_min_and_max=True)
+        self.logger.log_tabular('TestEpLen', average_only=True)
+        self.logger.log_tabular('Q1Vals', with_min_and_max=True)
+        self.logger.log_tabular('Q2Vals', with_min_and_max=True)
+        self.logger.log_tabular('LogPi', with_min_and_max=True)
+        self.logger.log_tabular('LossPi', average_only=True)
+        self.logger.log_tabular('LossQ', average_only=True)
+        self.logger.log_tabular('CQLalpha', average_only=True)
+        self.logger.dump_tabular()
 

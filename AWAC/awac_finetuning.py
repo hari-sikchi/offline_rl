@@ -49,7 +49,7 @@ class ReplayBuffer:
 
 
 
-class CWR:
+class AWAC_online:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=2000, epochs=10000, replay_size=int(2000000), gamma=0.99, 

@@ -80,19 +80,40 @@ class SquashedGaussianMLPActor(nn.Module):
         log_std = self.log_std_layer(net_out)
         return mu,log_std
 
-    def get_logprob(self,obs, actions):
+    # def get_logprob(self,obs, actions):
+    #     net_out = self.net(obs)
+    #     mu = self.mu_layer(net_out)
+    #     log_std = self.log_std_layer(net_out)
+    #     log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+    #     std = torch.exp(log_std)
+    #     pi_distribution = Normal(mu, std)
+    #     logp_pi = pi_distribution.log_prob(actions).sum(axis=-1)
+    #     logp_pi -= (2*(np.log(2) - actions - F.softplus(-2*actions))).sum(axis=1)
+
+    #     return logp_pi
+
+
+    def get_logprob(self, obs, act):
+        value = torch.clamp(act, -0.999999, 0.999999)
+        pre_tanh_value = torch.log(1+value) / 2 - torch.log(1-value) / 2
+
+
         net_out = self.net(obs)
         mu = self.mu_layer(net_out)
         log_std = self.log_std_layer(net_out)
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         std = torch.exp(log_std)
+        # Pre-squash distribution and sample
         pi_distribution = Normal(mu, std)
-        logp_pi = pi_distribution.log_prob(actions).sum(axis=-1)
-        logp_pi -= (2*(np.log(2) - actions - F.softplus(-2*actions))).sum(axis=1)
-
-        return logp_pi
-
-
+        log_prob_val = pi_distribution.log_prob(pre_tanh_value)
+        
+        correction = - 2. * (
+            torch.from_numpy(np.log([2.])).to(pre_tanh_value.get_device())
+            - pre_tanh_value
+            - torch.nn.functional.softplus(-2. * pre_tanh_value)
+        ).sum(dim=1)
+        
+        return log_prob_val.sum(dim=1) + correction
 
 
 class awacMLPActor(nn.Module):
@@ -181,7 +202,7 @@ class MLPQFunction(nn.Module):
             self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs, act):
-        q = self.q(torch.cat([obs, act], dim=-1))
+        q = self.q(torch.cat([obs, act], dim=-1).to(device))
         return torch.squeeze(q, -1) # Critical to ensure q has right shape.
 
 
@@ -225,12 +246,9 @@ class MLPActorCritic(nn.Module):
         if special_policy is 'vectorQ':
             self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes,  activation,output_size=5).to(device)
             self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation, output_size=5).to(device)
-        if special_policy is 'awac':
-            self.q1 = MLPQRankFunction(obs_dim, act_dim, hidden_sizes,  activation,output_size=5).to(device)
-            self.q2 = MLPQRankFunction(obs_dim, act_dim, hidden_sizes, activation, output_size=5).to(device)
-        else:            
-            self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
-            self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
+         
+        self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
+        self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
         self.v = MLPVFunction(obs_dim, act_dim, hidden_sizes, activation).to(device)
 
 

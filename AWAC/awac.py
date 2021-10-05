@@ -8,10 +8,12 @@ import gym
 import time
 import core as core
 from utils.logx import EpochLogger
-from torch.autograd import Variable
+import torch.nn.functional as F
+import pickle
 
-device = torch.device("cpu")
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer for SAC agents.
@@ -34,31 +36,26 @@ class ReplayBuffer:
         self.ptr = (self.ptr+1) % self.max_size
         self.size = min(self.size+1, self.max_size)
 
-    def sample_batch(self, batch_size=32):
-        idxs = np.random.randint(0, self.size, size=batch_size)
+    def sample_batch(self, batch_size=32, idxs=None):
+        if idxs is None:
+            idxs = np.random.randint(0, self.size, size=batch_size)
+
         batch = dict(obs=self.obs_buf[idxs],
                      obs2=self.obs2_buf[idxs],
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
                      done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32).to(device) for k,v in batch.items()}
 
 
 
-'''
-CQL variants
-cql-rho-fixedAlpha
-cql-rho-lagrange
-cql-H-fixedAlpha
-cql-H-lagrange
-'''
-class DT:
+class AWAC:
 
     def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=100, epochs=10000, replay_size=int(1500000), gamma=0.99, 
-        polyak=0.995, lr=3e-4, p_lr=3e-5, alpha=0.2, batch_size=100, start_steps=10000, 
+        steps_per_epoch=100, epochs=10000, replay_size=int(2000000), gamma=0.99, 
+        polyak=0.995, lr=3e-4, p_lr=3e-4, alpha=0.0, batch_size=1024, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, algo='CQL'):
+        logger_kwargs=dict(), save_freq=1, algo='SAC'):
         """
         Soft Actor-Critic (SAC)
 
@@ -170,7 +167,7 @@ class DT:
         self.act_limit = self.env.action_space.high[0]
 
         # Create actor-critic module and target networks
-        self.ac = actor_critic(self.env.observation_space, self.env.action_space, **ac_kwargs)
+        self.ac = actor_critic(self.env.observation_space, self.env.action_space, special_policy='awac', **ac_kwargs)
         self.ac_targ = deepcopy(self.ac)
         self.gamma  = gamma
 
@@ -190,21 +187,11 @@ class DT:
         self.logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
         self.algo = algo
 
-        self.lagrange_threshold = 10
-        self.penalty_lr = 5e-2
-        self.lamda = Variable(torch.log(torch.exp(torch.Tensor([5]))-1), requires_grad=True)
-        self.lamda_optimizer = torch.optim.Adam([self.lamda],lr=self.penalty_lr)
-        self.tune_lambda = True if 'lagrange' in self.algo else False
-
-
-        self.alpha = 0 
-        self.target_update_freq = 1
-        self.p_lr = 3e-5
-        self.lr = 3e-4
-
-
+        self.p_lr = p_lr
+        self.lr = lr
+        self.alpha = 0
         # Set up optimizers for policy and q-function
-        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr)
+        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.p_lr, weight_decay=1e-4)
         self.q_optimizer = Adam(self.q_params, lr=self.lr)
         self.num_test_episodes = num_test_episodes
         self.max_ep_len = max_ep_len
@@ -215,11 +202,10 @@ class DT:
         self.batch_size = batch_size
         self.save_freq = save_freq
         self.polyak = polyak
-        self.quantile_threshold = 0.01
-
         # Set up model saving
         self.logger.setup_pytorch_saver(self.ac)
         print("Running Offline RL algorithm: {}".format(self.algo))
+
 
     def populate_replay_buffer(self):
         dataset = d4rl.qlearning_dataset(self.env)
@@ -230,8 +216,7 @@ class DT:
         self.replay_buffer.done_buf[:dataset['terminals'].shape[0]] = dataset['terminals']
         self.replay_buffer.size = dataset['observations'].shape[0]
         self.replay_buffer.ptr = (self.replay_buffer.size+1)%(self.replay_buffer.max_size)
-
-
+        print("Size of dataset: {}".format(dataset['observations'].shape[0]))
 
     # Set up function for computing SAC Q-losses
     def compute_loss_q(self, data):
@@ -245,12 +230,9 @@ class DT:
             # Target actions come from *current* policy
             a2, logp_a2 = self.ac.pi(o2)
 
-            visitation_prob = torch.exp(self.sampling_policy.log_prob(torch.cat((o2,a2),dim=1)))
-
-
             # Target Q-values
-            q1_pi_targ = self.ac_targ.q1(o2, a2) * (visitation_prob>self.density_threshold)
-            q2_pi_targ = self.ac_targ.q2(o2, a2) * (visitation_prob>self.density_threshold)
+            q1_pi_targ = self.ac_targ.q1(o2, a2)
+            q2_pi_targ = self.ac_targ.q2(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + self.gamma * (1 - d) * (q_pi_targ - self.alpha * logp_a2)
 
@@ -259,28 +241,33 @@ class DT:
         loss_q2 = ((q2 - backup)**2).mean()
         loss_q = loss_q1 + loss_q2
 
-
-
         # Useful info for logging
-        q_info = dict(Q1Vals=q1.detach().numpy(),
-                      Q2Vals=q2.detach().numpy())
+        q_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                      Q2Vals=q2.detach().cpu().numpy())
 
         return loss_q, q_info
 
     # Set up function for computing SAC pi loss
     def compute_loss_pi(self,data):
         o = data['obs']
+
         pi, logp_pi = self.ac.pi(o)
         q1_pi = self.ac.q1(o, pi)
         q2_pi = self.ac.q2(o, pi)
-        q_pi = torch.min(q1_pi, q2_pi)
+        v_pi = torch.min(q1_pi, q2_pi)
 
-        
-        loss_pi = (self.alpha * logp_pi - q_pi).mean()
+        beta = 2
+        q1_old_actions = self.ac.q1(o, data['act'])
+        q2_old_actions = self.ac.q2(o, data['act'])
+        q_old_actions = torch.min(q1_old_actions, q2_old_actions)
 
+        adv_pi = q_old_actions - v_pi
+        weights = F.softmax(adv_pi / beta, dim=0)
+        policy_logpp = self.ac.pi.get_logprob(o, data['act'])
+        loss_pi = (-policy_logpp * len(weights)*weights.detach()).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().numpy())
+        pi_info = dict(LogPi=policy_logpp.detach().cpu().numpy())
 
         return loss_pi, pi_info
 
@@ -293,10 +280,8 @@ class DT:
         loss_q.backward()
         self.q_optimizer.step()
 
-
         # Record things
         self.logger.store(LossQ=loss_q.item(), **q_info)
-
         # Freeze Q-networks so you don't waste computational effort 
         # computing gradients for them during the policy learning step.
         for p in self.q_params:
@@ -316,16 +301,15 @@ class DT:
         self.logger.store(LossPi=loss_pi.item(), **pi_info)
 
         # Finally, update target networks by polyak averaging.
-        if update_timestep%self.target_update_freq==0:
-            with torch.no_grad():
-                for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
-                    p_targ.data.mul_(self.polyak)
-                    p_targ.data.add_((1 - self.polyak) * p.data)
+        with torch.no_grad():
+            for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                p_targ.data.mul_(self.polyak)
+                p_targ.data.add_((1 - self.polyak) * p.data)
 
     def get_action(self, o, deterministic=False):
-        return self.ac.act(torch.as_tensor(o, dtype=torch.float32), 
+        return self.ac.act(torch.as_tensor(o, dtype=torch.float32).to(device), 
                       deterministic)
 
     def test_agent(self):
@@ -336,50 +320,11 @@ class DT:
                 o, r, d, _ = self.test_env.step(self.get_action(o, True))
                 ep_ret += r
                 ep_len += 1
-            self.logger.store(TestEpRet=100*self.test_env.get_normalized_score(ep_ret), TestEpLen=ep_len)
+            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            self.logger.store(NormTestEpRet=100*self.test_env.get_normalized_score(ep_ret))
 
     def run(self):
-
-        # Learn a generative model for data
-        density_epochs = 50
-        self.sampling_policy = core.MADE(self.act_dim+self.obs_dim[0], 256, 3)
-        density_optimizer = torch.optim.Adam(self.sampling_policy.parameters(), lr=1e-4, weight_decay=1e-6)
-        pdf_buffer = None
-        for i in range(density_epochs):
-            sample_indices = np.random.choice(
-                    self.replay_buffer.size, self.replay_buffer.size)
-            np.random.shuffle(sample_indices)
-            ctr = 0
-            total_loss = 0
-            for j in range(0, self.replay_buffer.size, self.batch_size):
-                actions = self.replay_buffer.act_buf[sample_indices[ctr * self.batch_size:(
-                        ctr + 1) * self.batch_size],:]
-                actions = torch.FloatTensor(actions)
-                obs = self.replay_buffer.obs_buf[sample_indices[ctr * self.batch_size:(
-                        ctr + 1) * self.batch_size],:]
-                obs = torch.FloatTensor(obs)
-                density_optimizer.zero_grad()
-                loss = self.sampling_policy.log_prob(torch.cat((obs,actions),dim=1))
-                if i == density_epochs-1:
-                    if pdf_buffer is None:
-                        pdf_buffer = loss.view(-1).data
-                    else:
-                        pdf_buffer = torch.cat((pdf_buffer,loss.view(-1).data))
-                loss = -loss.mean()
-                loss.backward()
-                total_loss+=loss.data * self.batch_size
-                density_optimizer.step()
-                ctr+=1
-                
-
-            print("Density training loss: {}".format(total_loss/self.replay_buffer.size))
-
-        self.density_threshold = np.exp(np.quantile(pdf_buffer.detach().cpu().numpy(),self.quantile_threshold))
-        print("Density threshold is set to be :{}".format(self.density_threshold))
-
-
-
-        # Prepare for interaction with environment
+       # Prepare for interaction with environment
         total_steps = self.epochs * self.steps_per_epoch
         start_time = time.time()
         o, ep_ret, ep_len = self.env.reset(), 0, 0
@@ -404,6 +349,7 @@ class DT:
 
                 # Log info about epoch
                 self.logger.log_tabular('Epoch', epoch)
+                self.logger.log_tabular('NormTestEpRet', with_min_and_max=True)
                 self.logger.log_tabular('TestEpRet', with_min_and_max=True)
                 self.logger.log_tabular('TestEpLen', average_only=True)
                 self.logger.log_tabular('TotalUpdates', t)
@@ -414,4 +360,6 @@ class DT:
                 self.logger.log_tabular('LossQ', average_only=True)
                 self.logger.log_tabular('Time', time.time()-start_time)
                 self.logger.dump_tabular()
+
+
 
