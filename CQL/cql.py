@@ -200,10 +200,10 @@ class CQL:
             self.log_lamda = torch.zeros(1, requires_grad=True, device=device)
             self.lamda_optimizer = torch.optim.Adam([self.log_lamda],lr=self.penalty_lr)
             self.lamda = self.log_lamda.exp()
-            # self.min_q_weight = 1.0
+            self.min_q_weight = 1.0
         else:            
-            self.lamda = min_q_weight
-            # self.min_q_weight = min_q_weight
+            # self.lamda = min_q_weight
+            self.min_q_weight = min_q_weight
         self.automatic_alpha_tuning = automatic_alpha_tuning
         if self.automatic_alpha_tuning is True:
             self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape)).item()
@@ -278,28 +278,21 @@ class CQL:
         if 'rho' in self.algo:
             samples = 10
             # Sample from previous policy (10 samples)
-            cql_loss_q1 = None
-            cql_loss_q2 = None
-            for sample in range(samples):
-                sample_action, _ = self.ac.pi(o)
-                if cql_loss_q1 is None:
-                    cql_loss_q1 = self.ac.q1(o,sample_action).view(-1,1)
-                    cql_loss_q2 = self.ac.q2(o,sample_action).view(-1,1)
-                else:
-                    cql_loss_q1 = torch.cat((cql_loss_q1,self.ac.q1(o,sample_action).view(-1,1) ),dim=1)
-                    cql_loss_q2 = torch.cat((cql_loss_q2,self.ac.q2(o,sample_action).view(-1,1) ),dim=1)
+            o_rep = o.repeat_interleave(repeats=samples,dim=0)
+            sample_actions, _ = self.ac.pi(o_rep)
+            cql_loss_q1 = self.ac.q1(o_rep,sample_actions).reshape(-1,1)
+            cql_loss_q2 = self.ac.q2(o_rep,sample_actions).reshape(-1,1)
 
             cql_loss_q1 = cql_loss_q1-np.log(samples)
             cql_loss_q2 = cql_loss_q2-np.log(samples)
 
-            cql_loss_q1 = torch.logsumexp(cql_loss_q1,dim=1).mean()
-            cql_loss_q2 = torch.logsumexp(cql_loss_q2,dim=1).mean()
+            cql_loss_q1 = torch.logsumexp(cql_loss_q1,dim=1).mean()*self.min_q_weight
+            cql_loss_q2 = torch.logsumexp(cql_loss_q2,dim=1).mean()*self.min_q_weight
             
             # Sample from dataset
-            cql_loss_q1 -= self.ac.q1(o, a).mean()
-            cql_loss_q2 -= self.ac.q2(o, a).mean()
-            avg_q = 0.5*(cql_loss_q1.mean() + cql_loss_q2.mean()).detach().cpu()
-            loss_q += cql_alpha*(cql_loss_q1.mean() + cql_loss_q2.mean())
+            cql_loss_q1 -= self.ac.q1(o, a).mean()*self.min_q_weight
+            cql_loss_q2 -= self.ac.q2(o, a).mean()*self.min_q_weight
+
         else:
             samples = 10 
             q1_pi_samples = None
@@ -336,30 +329,29 @@ class CQL:
             q1_rand_samples = q1_rand_samples.view((o.shape[0],-1))
             q2_rand_samples = q2_rand_samples.view((o.shape[0],-1))
             
-            cql_loss_q1 = torch.logsumexp(torch.cat([q1_pi_samples,q1_next_pi_samples,q1_rand_samples],dim=1),dim=1).mean()*self.lamda 
-            cql_loss_q2 = torch.logsumexp(torch.cat((q2_pi_samples,q2_next_pi_samples,q2_rand_samples),dim=1),dim=1).mean()*self.lamda
+            cql_loss_q1 = torch.logsumexp(torch.cat([q1_pi_samples,q1_next_pi_samples,q1_rand_samples],dim=1),dim=1).mean()*self.min_q_weight 
+            cql_loss_q2 = torch.logsumexp(torch.cat((q2_pi_samples,q2_next_pi_samples,q2_rand_samples),dim=1),dim=1).mean()*self.min_q_weight
 
 
             
             # Sample from dataset
-            cql_loss_q1 -= self.ac.q1(o, a).mean()*self.lamda
-            cql_loss_q2 -= self.ac.q2(o, a).mean()*self.lamda
+            cql_loss_q1 -= self.ac.q1(o, a).mean()*self.min_q_weight
+            cql_loss_q2 -= self.ac.q2(o, a).mean()*self.min_q_weight
 
-            # Update the cql-alpha
-            if 'lagrange' in self.algo:
-                cql_alpha = torch.clamp(self.log_lamda.exp(), min=0.0, max=1000000.0)
-                self.lamda = cql_alpha
-                cql_loss_q1 = cql_alpha*(cql_loss_q1-self.target_action_gap)
-                cql_loss_q2 = cql_alpha*(cql_loss_q2-self.target_action_gap)
-                
-                self.lamda_optimizer.zero_grad()
-                lamda_loss = (-cql_loss_q1-cql_loss_q2)*0.5
-                lamda_loss.backward(retain_graph=True)
-                self.lamda_optimizer.step()
-                # print(self.log_lamda.exp())
+        # Update the cql-alpha
+        if 'lagrange' in self.algo:
+            cql_alpha = torch.clamp(self.log_lamda.exp(), min=0.0, max=1000000.0)
+            self.lamda = cql_alpha.item()
+            cql_loss_q1 = cql_alpha*(cql_loss_q1-self.target_action_gap)
+            cql_loss_q2 = cql_alpha*(cql_loss_q2-self.target_action_gap)
+            self.lamda_optimizer.zero_grad()
+            lamda_loss = (-cql_loss_q1-cql_loss_q2)*0.5
+            lamda_loss.backward(retain_graph=True)
+            self.lamda_optimizer.step()
+            # print(self.log_lamda.exp())
 
-            avg_q = 0.5*(cql_loss_q1.mean() + cql_loss_q2.mean()).detach().cpu()
-            loss_q += (cql_loss_q1.mean() + cql_loss_q2.mean())
+        avg_q = 0.5*(cql_loss_q1.mean() + cql_loss_q2.mean()).detach().cpu()
+        loss_q += (cql_loss_q1.mean() + cql_loss_q2.mean())
 
 
         # Useful info for logging
