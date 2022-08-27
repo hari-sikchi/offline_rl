@@ -7,6 +7,7 @@ authors:
     given-names: Harshit
 cff-version: "1.1.0"
 license: MIT
+doi: 10.5281/zenodo.7027984
 message: "If you use this software, please cite it using these metadata."
 repository-code: "https://github.com/hari-sikchi/offline_rl"
 title: offlineRL
